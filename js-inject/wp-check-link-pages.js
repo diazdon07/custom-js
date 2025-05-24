@@ -1,23 +1,40 @@
-async function runSitemapUsageAnalyzer() {
-  const origin_url = window.location.origin;
-  const page_sitemap = origin_url + '/page-sitemap.xml';
-  const sitedata = [];
+const origin_url = window.location.origin;
+const sitemapIndexUrl = origin_url + '/sitemap_index.xml';
 
-  try {
-    const response = await fetch(page_sitemap);
-    if (!response.ok) throw new Error('Sitemap not found.');
-    const xmlText = await response.text();
+async function fetchXml(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to fetch XML from ${url}`);
+  const text = await response.text();
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(text, "application/xml");
+  if (xmlDoc.querySelector('parsererror')) {
+    throw new Error(`Error parsing XML from ${url}`);
+  }
+  return xmlDoc;
+}
 
-    const parser = new DOMParser();
-    const xmlDoc = parser.parseFromString(xmlText, 'application/xml');
-    const errorNode = xmlDoc.querySelector('parsererror');
-    if (errorNode) throw new Error('Error parsing XML sitemap.');
+async function extractUrlsFromSitemap(sitemapUrl) {
+  const xmlDoc = await fetchXml(sitemapUrl);
+  const locElements = xmlDoc.querySelectorAll("url > loc");
+  return Array.from(locElements)
+    .map(el => el.textContent.trim())
+    .filter(url => !url.includes('wp-content'))
+    .map(url => url.replace(/\/$/, ''));
+}
 
-    const links = xmlDoc.querySelectorAll('loc');
-    links.forEach(link => {
-      const url = link.textContent.trim().replace(/\/$/, '');
-      if (!url.includes('wp-content')) {
-        sitedata.push({
+async function getSitemapsWithUrlsArrayGrouped(indexUrl) {
+  const indexXml = await fetchXml(indexUrl);
+  const sitemapUrls = Array.from(indexXml.querySelectorAll("sitemap > loc")).map(el => el.textContent.trim());
+
+  const sitemapGroups = [];
+
+  for (const sitemapUrl of sitemapUrls) {
+    try {
+      const urls = await extractUrlsFromSitemap(sitemapUrl);
+      sitemapGroups.push({
+        sitemapUrl,
+        urls,
+        sitedata: urls.map(url => ({
           url,
           usedCount: 0,
           usedByPages: {},
@@ -29,181 +46,172 @@ async function runSitemapUsageAnalyzer() {
           internalLinks: 0,
           externalLinks: 0,
           wordCount: 0
-        });
-      }
-    });
+        }))
+      });
+    } catch (err) {
+      console.error(`Failed to fetch URLs from ${sitemapUrl}`, err);
+    }
+  }
 
-    await crawlEntireSite(sitedata);
+  sitemapGroups.sort((a, b) => {
+    const aName = (a.sitemapUrl.match(/\/([\w\-]+)\.xml$/) || [])[1] || a.sitemapUrl;
+    const bName = (b.sitemapUrl.match(/\/([\w\-]+)\.xml$/) || [])[1] || b.sitemapUrl;
+    return aName.localeCompare(bName);
+  });
+
+  return sitemapGroups;
+}
+
+async function runSitemapUsageAnalyzer() {
+  try {
+    const sitemapGroups = await getSitemapsWithUrlsArrayGrouped(sitemapIndexUrl);
+
+    for (const group of sitemapGroups) {
+      await crawlEntireSite(group.sitedata);
+    }
+
+    window.sitemapGroups = sitemapGroups;
+    openSummaryAccordion(sitemapGroups);
   } catch (error) {
     console.error('Error fetching or parsing sitemap:', error);
   }
+}
 
-  async function crawlEntireSite(sitedata) {
-    const batchSize = 3;
-    const delayBetweenBatches = 500;
-    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+async function crawlEntireSite(sitedata) {
+  const batchSize = 3;
+  const delayBetweenBatches = 500;
+  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    for (let i = 0; i < sitedata.length; i += batchSize) {
-      const batch = sitedata.slice(i, i + batchSize);
-      await Promise.all(batch.map(entry => fetchAndAnalyzePage(entry, sitedata)));
-      await delay(delayBetweenBatches);
-    }
-
-    console.log('✅ Crawl complete. Site usage data:');
-    console.table(sitedata.map(p => ({
-      URL: p.url,
-      Status: p.status,
-      Title: p.title,
-      UsedCount: p.usedCount,
-      LinkedBy: Object.keys(p.usedByPages).length
-    })));
-
-    window.sitemapUsageResult = sitedata;
-    openSummaryTab(sitedata);
-  }
-
-  async function fetchAndAnalyzePage(pageEntry, sitedata) {
-    try {
-      const response = await fetch(pageEntry.url, { method: 'GET' });
-      pageEntry.status = response.ok ? 'OK' : 'Error';
-      pageEntry.statusCode = response.status;
-
-      if (!response.ok) return;
-
-      const html = await response.text();
-      const parser = new DOMParser();
-      let doc;
-      try {
-        doc = parser.parseFromString(html, 'text/html');
-      } catch {
-        return;
-      }
-
-      // Extract metadata
-      pageEntry.title = doc.querySelector('title')?.innerText || '';
-      pageEntry.metaDescription = doc.querySelector('meta[name="description"]')?.getAttribute('content') || '';
-      pageEntry.canonical = doc.querySelector('link[rel="canonical"]')?.getAttribute('href') || '';
-
-      const links = Array.from(doc.querySelectorAll('a[href]'));
-      const bodyText = doc.body?.innerText || '';
-      pageEntry.wordCount = bodyText.trim().split(/\s+/).length;
-
-      links.forEach(link => {
-        let href = link.href.split('#')[0].replace(/\/$/, '');
-        try {
-          const url = new URL(href);
-          if (url.origin === origin_url) {
-            pageEntry.internalLinks += 1;
-            const target = sitedata.find(item => item.url === href);
-            if (target) {
-              target.usedCount += 1;
-              if (!target.usedByPages[pageEntry.url]) {
-                target.usedByPages[pageEntry.url] = 1;
-              } else {
-                target.usedByPages[pageEntry.url] += 1;
-              }
-            }
-          } else {
-            pageEntry.externalLinks += 1;
-          }
-        } catch {}
-      });
-    } catch (err) {
-      pageEntry.status = 'Error';
-      pageEntry.statusCode = err.message;
-    }
-  }
-
-  function openSummaryTab(sitedata) {
-    const newWindow = window.open('', '_blank');
-    if (!newWindow) {
-      alert('Popup blocked. Please allow popups for this site.');
-      return;
-    }
-
-    const summaryHtml = `
-      <html>
-      <head>
-        <title>Sitemap Usage Summary</title>
-        <style>
-          body { font-family: Arial; padding: 30px; background: #f9f9f9; color: #333; }
-          h1, h2 { color: #007acc; }
-          .summary-box { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 30px; }
-          .url-entry { background: #fff; border-left: 5px solid #007acc; margin-bottom: 16px; padding: 16px; border-radius: 6px; }
-          .url-entry p { margin: 4px 0; }
-          .status-ok { color: green; }
-          .status-error { color: red; }
-          .used-by { font-size: 0.9em; color: #555; margin-top: 10px; }
-          ul { padding-left: 20px; }
-          button { padding: 10px 16px; font-size: 14px; background: #007acc; border: none; color: white; border-radius: 4px; cursor: pointer; }
-        </style>
-      </head>
-      <body>
-        <h1>Sitemap Crawl & Usage Summary</h1>
-        <div class="summary-box">
-          <p><strong>Total Pages:</strong> ${sitedata.length}</p>
-          <p><strong>Linked Pages:</strong> ${sitedata.filter(d => d.usedCount > 0).length}</p>
-          <p><strong>Unlinked Pages:</strong> ${sitedata.filter(d => d.usedCount === 0).length}</p>
-          <p><strong>Error Pages:</strong> ${sitedata.filter(d => d.status !== 'OK').length}</p>
-          <button onclick="(${exportToCSV.toString()})()">Export CSV</button>
-        </div>
-        <h2>Page Details</h2>
-        ${sitedata.map(item => `
-          <div class="url-entry">
-            <p><strong>URL:</strong> <a href="${item.url}" target="_blank">${item.url}</a></p>
-            <p><strong>Title:</strong> ${item.title}</p>
-            <p><strong>Status:</strong> <span class="${item.status === 'OK' ? 'status-ok' : 'status-error'}">${item.status} (${item.statusCode})</span></p>
-            <p><strong>Word Count:</strong> ${item.wordCount}</p>
-            <p><strong>Internal Links:</strong> ${item.internalLinks} | <strong>External Links:</strong> ${item.externalLinks}</p>
-            <p><strong>Meta Description:</strong> ${item.metaDescription || '<em>None</em>'}</p>
-            <p><strong>Canonical:</strong> ${item.canonical || '<em>None</em>'}</p>
-            <p><strong>Usage Count:</strong> ${item.usedCount}</p>
-            ${Object.keys(item.usedByPages).length ? `
-              <div class="used-by">
-                <strong>Used by:</strong>
-                <ul>${Object.entries(item.usedByPages).map(([url, count]) =>
-                  `<li><a href="${url}" target="_blank">${url}</a> (${count})</li>`).join('')}
-                </ul>
-              </div>` : '<p><em>Not linked from any page.</em></p>'}
-          </div>`).join('')}
-      </body>
-      </html>
-    `;
-
-    newWindow.document.write(summaryHtml);
-    newWindow.document.close();
-  }
-
-  function exportToCSV() {
-    const data = window.sitemapUsageResult || [];
-    const rows = [
-      ['URL', 'Title', 'Status', 'StatusCode', 'WordCount', 'InternalLinks', 'ExternalLinks', 'UsedCount', 'LinkedBy', 'MetaDescription', 'Canonical'],
-      ...data.map(item => [
-        item.url,
-        item.title,
-        item.status,
-        item.statusCode,
-        item.wordCount,
-        item.internalLinks,
-        item.externalLinks,
-        item.usedCount,
-        Object.keys(item.usedByPages).length,
-        item.metaDescription,
-        item.canonical
-      ])
-    ];
-    const csv = rows.map(r => r.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'sitemap-usage-crawl-data.csv';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  for (let i = 0; i < sitedata.length; i += batchSize) {
+    const batch = sitedata.slice(i, i + batchSize);
+    await Promise.all(batch.map(entry => fetchAndAnalyzePage(entry, sitedata)));
+    await delay(delayBetweenBatches);
   }
 }
 
-// Ctrl + Shift + U
+async function fetchAndAnalyzePage(pageEntry, sitedata) {
+  try {
+    const response = await fetch(pageEntry.url, { method: 'GET' });
+    pageEntry.status = response.ok ? 'OK' : 'Error';
+    pageEntry.statusCode = response.status;
+
+    if (!response.ok) return;
+
+    const html = await response.text();
+    const parser = new DOMParser();
+    let doc;
+    try {
+      doc = parser.parseFromString(html, 'text/html');
+    } catch {
+      return;
+    }
+
+    pageEntry.title = doc.querySelector('title')?.innerText || '';
+    pageEntry.metaDescription = doc.querySelector('meta[name="description"]')?.getAttribute('content') || '';
+    pageEntry.canonical = doc.querySelector('link[rel="canonical"]')?.getAttribute('href') || '';
+
+    const links = Array.from(doc.querySelectorAll('a[href]'));
+    const bodyText = doc.body?.innerText || '';
+    pageEntry.wordCount = bodyText.trim().split(/\s+/).length;
+
+    links.forEach(link => {
+      let href = link.href.split('#')[0].replace(/\/$/, '');
+      try {
+        const url = new URL(href);
+        if (url.origin === origin_url) {
+          pageEntry.internalLinks += 1;
+          const target = sitedata.find(item => item.url === href);
+          if (target) {
+            target.usedCount += 1;
+            if (!target.usedByPages[pageEntry.url]) {
+              target.usedByPages[pageEntry.url] = 1;
+            } else {
+              target.usedByPages[pageEntry.url] += 1;
+            }
+          }
+        } else {
+          pageEntry.externalLinks += 1;
+        }
+      } catch {}
+    });
+  } catch (err) {
+    pageEntry.status = 'Error';
+    pageEntry.statusCode = err.message;
+  }
+}
+
+function openSummaryAccordion(sitemapGroups) {
+  const newWindow = window.open('', '_blank');
+  if (!newWindow) {
+    alert('Popup blocked. Please allow popups for this site.');
+    return;
+  }
+
+  const accordionHtml = sitemapGroups.map((group, i) => {
+    const sitemapNameMatch = group.sitemapUrl.match(/\/([\w\-]+)\.xml$/);
+    const sitemapName = sitemapNameMatch ? sitemapNameMatch[1] : group.sitemapUrl;
+
+    const total = group.sitedata.length;
+    const linkedPages = group.sitedata.filter(d => d.usedCount > 0);
+    const unlinkedPages = group.sitedata.filter(d => d.usedCount === 0);
+    const errors = group.sitedata.filter(d => d.status !== 'OK').length;
+
+    const sortUrls = arr => arr.slice().sort((a, b) => a.url.localeCompare(b.url));
+
+    return `
+    <details ${i === 0 ? 'open' : ''} style="margin-bottom: 15px; border:1px solid #ccc; border-radius:6px; padding: 10px;">
+      <summary style="font-weight:bold; cursor:pointer; font-size: 1.2em; color:#007acc;">
+        ${sitemapName} — Total: ${total}, Linked: ${linkedPages.length}, Unlinked: ${unlinkedPages.length}, Errors: ${errors}
+      </summary>
+
+      <h3 style="margin-top: 15px; color: #2c3e50;">Active Links (${linkedPages.length})</h3>
+      <ul style="max-height: 200px; overflow-y: auto; padding-left: 20px; font-family: monospace; font-size: 0.9em; border: 1px solid #d1d1d1; border-radius: 4px; background: #e6ffed;">
+        ${sortUrls(linkedPages).map(page => {
+          return `<li>
+            <a href="${page.url}" target="_blank" style="color: green; text-decoration:none;">${page.url}</a>
+            ${page.status !== 'OK' ? ` - <strong>Status: ${page.status}</strong>` : ''}
+          </li>`;
+        }).join('')}
+      </ul>
+
+      <h3 style="margin-top: 15px; color: #7f8c8d;">Unlinked Pages (${unlinkedPages.length})</h3>
+      <ul style="max-height: 200px; overflow-y: auto; padding-left: 20px; font-family: monospace; font-size: 0.9em; border: 1px solid #d1d1d1; border-radius: 4px; background: #ffecec;">
+        ${sortUrls(unlinkedPages).map(page => {
+          const statusColor = page.status === 'OK' ? '#333' : (page.status === 'Pending' ? 'gray' : 'red');
+          return `<li>
+            <a href="${page.url}" target="_blank" style="color:${statusColor}; text-decoration:none;">${page.url}</a>
+            ${page.status !== 'OK' ? ` - <strong>Status: ${page.status}</strong>` : ''}
+          </li>`;
+        }).join('')}
+      </ul>
+    </details>
+    `;
+  }).join('\n');
+
+  const summaryHtml = `
+  <html>
+  <head>
+    <title>Sitemap Usage Summary Accordion</title>
+    <style>
+      body { font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px; color: #333; }
+      a:hover { text-decoration: underline; }
+      summary::-webkit-details-marker { color: #007acc; }
+      summary { outline: none; }
+      h3 { margin-bottom: 5px; }
+    </style>
+  </head>
+  <body>
+    <h1>Sitemap Crawl & Usage Summary (Grouped by Sitemap)</h1>
+    ${accordionHtml}
+  </body>
+  </html>
+  `;
+
+  newWindow.document.write(summaryHtml);
+  newWindow.document.close();
+}
+
+// Run with Ctrl+Shift+U
 document.addEventListener('keydown', e => {
   if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'u') {
     e.preventDefault();
